@@ -1637,20 +1637,24 @@ A cat is chasing a dog. <''-'road'-'grass'>
                 setattr(p,'cached_params',types.MethodType(fake_cached_params,p))
 
     try:
-        cls = modules.sd_hijack.StableDiffusionModelHijack
-        get_prompt_lengths = cls.get_prompt_lengths
-        field = '__embedding_merge_wrapper'
-        def hook_prompt_lengths(self,text,*ar,**kw):
-            if text.find("<'")<0 and text.find("{'")<0:
-                return get_prompt_lengths(self,text,*ar,**kw)
-            (res,err) = merge_one_prompt(grab_embedding_cache(),None,{},None,text,True,True)
-            if err is not None:
-                return -1,-1
-            return get_prompt_lengths(self,res,*ar,**kw)
-        if hasattr(get_prompt_lengths,field):
-            get_prompt_lengths = getattr(get_prompt_lengths,field)
-        setattr(hook_prompt_lengths,field,get_prompt_lengths)
-        cls.get_prompt_lengths = hook_prompt_lengths
+        sd_hijack = getattr(modules,'sd_hijack',None)
+        if sd_hijack is None:
+            print('Embedding Merge: prompt-length hook skipped because modules.sd_hijack is unavailable')
+        else:
+            cls = sd_hijack.StableDiffusionModelHijack
+            get_prompt_lengths = cls.get_prompt_lengths
+            field = '__embedding_merge_wrapper'
+            def hook_prompt_lengths(self,text,*ar,**kw):
+                if text.find("<'")<0 and text.find("{'")<0:
+                    return get_prompt_lengths(self,text,*ar,**kw)
+                (res,err) = merge_one_prompt(grab_embedding_cache(),None,{},None,text,True,True)
+                if err is not None:
+                    return -1,-1
+                return get_prompt_lengths(self,res,*ar,**kw)
+            if hasattr(get_prompt_lengths,field):
+                get_prompt_lengths = getattr(get_prompt_lengths,field)
+            setattr(hook_prompt_lengths,field,get_prompt_lengths)
+            cls.get_prompt_lengths = hook_prompt_lengths
     except:
         traceback.print_exc()
 
@@ -1692,11 +1696,13 @@ A cat is chasing a dog. <''-'road'-'grass'>
         reset_temp_embeddings('-',True)
         reset_temp_embeddings('/',True)
         try:
-            cls = modules.sd_hijack.StableDiffusionModelHijack
-            get_prompt_lengths = cls.get_prompt_lengths
-            field = '__embedding_merge_wrapper'
-            if hasattr(get_prompt_lengths,field):
-                cls.get_prompt_lengths = getattr(get_prompt_lengths,field)
+            sd_hijack = getattr(modules,'sd_hijack',None)
+            if sd_hijack is not None:
+                cls = sd_hijack.StableDiffusionModelHijack
+                get_prompt_lengths = cls.get_prompt_lengths
+                field = '__embedding_merge_wrapper'
+                if hasattr(get_prompt_lengths,field):
+                    cls.get_prompt_lengths = getattr(get_prompt_lengths,field)
         except:
             traceback.print_exc()
         try:
