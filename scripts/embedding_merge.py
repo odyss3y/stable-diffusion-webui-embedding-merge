@@ -26,13 +26,17 @@ WebUI Dependencies:
 
 import re
 import os
+import sys
 import torch
 import json
 import html
 import time
+import hashlib
 import types
 import traceback
 import threading
+import datetime
+import subprocess
 import gradio
 import modules
 from modules import shared, scripts, script_callbacks, devices, processing, sd_models
@@ -56,7 +60,7 @@ def _webui_embedding_merge_():
             with gradio.Row():
                 with gradio.Accordion('Embedding Merge extension! (Click here for usage instructions)', open=False):
                     with gradio.Accordion('Introduction...', open=False):
-                        gradio.Markdown('''
+                        gradio.Markdown(r'''
 ## Purpose:
 
 Did you know that StableDiffusion reads your prompt by so-called tokens? They are multidimensional numerical vectors that construct together words and phrases.
@@ -74,7 +78,7 @@ The tab `EM` can be used to:
 - create TI embeddings from text fragments with or without merging
 - check correctness of your merge expressions
 ''')
-                    gradio.Markdown('''
+                    gradio.Markdown(r'''
 ### TL;DR:
 
 Use syntax `<'one thing'+'another thing'>` to merge terms "one thing" and "another thing" together in one single embedding in your positive or negative prompts at runtime.
@@ -95,7 +99,7 @@ You can paste your vanilla prompt (without any other special syntax) into the te
 >intergalactic train, masterpiece, by Danh Víµ
 ''')
                     with gradio.Accordion('More about table columns and grouping of its rows...', open=False):
-                        gradio.Markdown('''
+                        gradio.Markdown(r'''
 ### Rows:
 
 - `By none` = interpret the prompt as a whole, extracting all characters from real tokens
@@ -127,7 +131,7 @@ If you type a new name into the textbox on the bottom, your whole current prompt
 - Creating a shortened part to quickly use in prompts (not recommended though, since you will lose the original text later), but with no other benefits;
 - Prepare TI embedding for actual training by using existing embeddings for its initialization.
 ''')
-                    gradio.Markdown('''
+                    gradio.Markdown(r'''
 ## Test merge expression:
 
 In EM tab you can enter a "merge expression" that starts with a single quote, to see how it will be parsed and combined by this extension. It should contain single quotes around literal texts or TI embeddings, and special operators between them. For example:
@@ -135,7 +139,7 @@ In EM tab you can enter a "merge expression" that starts with a single quote, to
 >'greg rutkowski'/4+'gustav dore'*0.75
 ''')
                     with gradio.Accordion('More about merge expression syntax...', open=False):
-                        gradio.Markdown('''
+                        gradio.Markdown(r'''
 ### Expression syntax:
 
 - `'one' + 'two'` = blend vectors together by simple sum of all values. If length is different, smallest part will be right-padded with zeroes.
@@ -186,7 +190,7 @@ If for some reason you couldn't use the syntax for merging prompts at runtime, a
 
 Also you can check numerical parameters of your trained textual embedding and compare it with "normal" vectors. For example, very large `Len` or `Std` will mean that something is wrong and at least you may divide it in attempt to fix.
 ''')
-                    gradio.Markdown('''
+                    gradio.Markdown(r'''
 ## Several merge expressions in prompt:
 
 If you put a valid merge expression enclosed in angular <'…' …> or curly {'…' …} brackets anywhere in your prompt (with no space between `<` or `{` and `'`) on EM tab, it will be parsed and merged into one temporary Textual Inversion embedding, which replaces the expression itself. The resulting prompt will be joined from those embeddings and anything between expressions. For example:
@@ -194,7 +198,7 @@ If you put a valid merge expression enclosed in angular <'…' …> or curly {'�
 >A photo of <'cat'+'dog'>, {'4k'+'dynamic lighting'+'science fiction'=/3} masterpiece
 ''')
                     with gradio.Accordion('More examples of using angular/curly brackets...', open=False):
-                        gradio.Markdown('''
+                        gradio.Markdown(r'''
 ### More examples:
 
 
@@ -222,7 +226,7 @@ Notes:
 
 Eliminating a part of the negative prompt by zeroing its vectors can be used to understand the effect of the part in question, without shifting the rest of the text otherwise. Since WebUI is splitting long prompts at arbitrary commas (and then merging resulting parts together), simple deletion of a part might change things severely.
 ''')
-                    gradio.Markdown('''
+                    gradio.Markdown(r'''
 ## Using merge expressions in prompts at runtime!
 
 You can actually put merge expressions in angular or curly brackets into your txt2img or img2img prompt in WebUI. This extension will intercept both main and negative prompts, parse and merge expressions creating temporary TI embeddings that WebUI will "see" instead of your original text. In generation info there will be internal meaningless names like <'EM_1'>, but extra parameter "EmbeddingMerge" will contain original merge expressions. To quickly restore your prompts, just paste your complete generation information (from .txt or PNG Info) into the textbox on EM tab (also it should work for the official "paste" toolbar button too) – its temporary embeddings will be replaced back with expressions, for example:
@@ -237,7 +241,7 @@ For your information replicating start tokens of the syntax itself:
 
 ''')
                     with gradio.Accordion('Limitations...', open=False):
-                        gradio.Markdown('''
+                        gradio.Markdown(r'''
 ### What is not working:
 
 #### Binding properties to objects:
@@ -303,17 +307,21 @@ A cat is chasing a dog. <''-'road'-'grass'>
                     return self.tokenizer.encoder
                 def byte_decoder(self):
                     return self.tokenizer.byte_decoder
-            clip = shared.sd_model.cond_stage_model
-            if hasattr(clip,'embedders'):
-                clip = clip.embedders[0]
+            def get_tokenizer_adapter_for_tokens_to_text():
+                for clip in get_model_clips():
+                    if clip is None:
+                        continue
+                    if hasattr(clip,'wrapped'):
+                        clip = clip.wrapped
+                    typename = type(clip).__name__.split('.')[-1]
+                    if typename=='FrozenOpenCLIPEmbedder':
+                        return OpenClip(clip)
+                    if hasattr(clip,'tokenizer') and hasattr(clip.tokenizer,'get_vocab') and hasattr(clip.tokenizer,'byte_decoder'):
+                        return VanillaClip(clip)
+                return None
+            clip = get_tokenizer_adapter_for_tokens_to_text()
             if clip is None:
                 return None
-            clip = clip.wrapped
-            typename = type(clip).__name__.split('.')[-1]
-            if typename=='FrozenOpenCLIPEmbedder':
-                clip = OpenClip(clip)
-            else:
-                clip = VanillaClip(clip)
             vocab = {v: k for k, v in clip.vocab().items()}
             byte_decoder = clip.byte_decoder()
             def _tokens_to_text(tokens):
@@ -362,19 +370,31 @@ A cat is chasing a dog. <''-'road'-'grass'>
         res = re.sub(r'([()[\]\\])',r'\\\1',line)
         return res
 
+    def compatible_text_engine(clip):
+        return clip is not None and (
+            hasattr(clip,'embeddings') or
+            hasattr(clip,'tokenize_line') or
+            hasattr(clip,'encode_embedding_init_text')
+        )
+
+    def forge_text_processing_engines(sd_model):
+        engines = []
+        for field in ('text_processing_engine_l','text_processing_engine_g','text_processing_engine'):
+            engine = getattr(sd_model,field,None)
+            if compatible_text_engine(engine):
+                engines.append(engine)
+        return tuple(engines)
+
     def get_model_clips():
         sd_model = shared.sd_model
         clip = sd_model.cond_stage_model
+        engines = forge_text_processing_engines(sd_model)
+        if engines and not compatible_text_engine(clip) and not hasattr(clip,'embedders'):
+            return engines
         if clip is None:
-            clip = sd_model.text_processing_engine if hasattr(sd_model,'text_processing_engine') else None
-            if clip is None:
-                clip_l = sd_model.text_processing_engine_l if hasattr(sd_model,'text_processing_engine_l') else None
-                clip_g = sd_model.text_processing_engine_g if hasattr(sd_model,'text_processing_engine_g') else None
-                if clip_l is not None:
-                    if clip_g is not None:
-                        return (clip_l,clip_g)
-                    return (clip_l,)
-                raise Exception_From_EmbeddingMergeExtension('Could not find CLIP model!')
+            if engines:
+                return engines
+            raise Exception_From_EmbeddingMergeExtension('Could not find CLIP model!')
         if(hasattr(clip,'embedders')):
             try:
                 return (clip.embedders[0],clip.embedders[1]) # SDXL
@@ -384,24 +404,40 @@ A cat is chasing a dog. <''-'road'-'grass'>
 
     def get_embedding_db():
         try:
-            db = modules.sd_hijack.model_hijack.embedding_db
+            sd_hijack = getattr(modules,'sd_hijack',None)
+            db = sd_hijack.model_hijack.embedding_db if sd_hijack is not None else None
             if db is not None:
                 return (db,)
         except:
             pass
         clips = get_model_clips()
-        return [c.embeddings for c in clips]
+        dbs = [c.embeddings for c in clips if hasattr(c,'embeddings')]
+        if len(dbs)>0:
+            return dbs
+        print('Embedding Merge: no compatible textual inversion embedding database found')
+        raise Exception_From_EmbeddingMergeExtension('Could not find textual inversion embedding database!')
 
     def tokenize_line(clip,text):
         if hasattr(clip,'encode_embedding_init_text'):
             return clip.tokenize_line(str_to_escape(text))
-        old = clip.emphasis.name
-        clip.emphasis.name = 'None'
-        try:
-            res = clip.tokenize_line(text)
-        finally:
-            clip.emphasis.name = old
-        return res
+        if hasattr(clip,'emphasis'):
+            old = clip.emphasis.name
+            clip.emphasis.name = 'None'
+            try:
+                res = clip.tokenize_line(text)
+            finally:
+                clip.emphasis.name = old
+            return res
+        if hasattr(clip,'tokenize_line'):
+            clip.emphasis = types.SimpleNamespace(name='None')
+            try:
+                return clip.tokenize_line(text)
+            finally:
+                try:
+                    delattr(clip,'emphasis')
+                except:
+                    pass
+        raise Exception_From_EmbeddingMergeExtension('Could not tokenize text with current text-processing engine')
 
     def encode_embedding_init_text(clip,text,length=999):
         if hasattr(clip,'encode_embedding_init_text'):
@@ -891,33 +927,36 @@ A cat is chasing a dog. <''-'road'-'grass'>
         return cache
 
     def register_embedding(name,embedding):
+        result = None
         for self in get_embedding_db():
             model = shared.sd_model
             if hasattr(self,'register_embedding_by_name'):
                 try:
-                    return self.register_embedding_by_name(embedding,model,name)
+                    result = self.register_embedding_by_name(embedding,model,name)
                 except TypeError:
-                    return self.register_embedding_by_name(embedding,name)
+                    result = self.register_embedding_by_name(embedding,name)
+                continue
             # /modules/textual_inversion/textual_inversion.py
             try:
                 ids = model.cond_stage_model.tokenize([name])[0]
                 first_id = ids[0]
             except:
-                return
+                continue
             if embedding is None:
-                if self.word_embeddings[name] is None:
-                    return
+                if name not in self.word_embeddings:
+                    continue
                 del self.word_embeddings[name]
             else:
                 self.word_embeddings[name] = embedding
             if first_id not in self.ids_lookup:
                 if embedding is None:
-                    return
+                    continue
                 self.ids_lookup[first_id] = []
             save = [(ids, embedding)] if embedding is not None else []
             old = [x for x in self.ids_lookup[first_id] if x[1].name!=name]
             self.ids_lookup[first_id] = sorted(old + save, key=lambda x: len(x[0]), reverse=True)
-            return embedding
+            result = embedding
+        return result
 
     def make_temp_embedding(name,vectors,cache,fake):
         embed = None
@@ -947,30 +986,36 @@ A cat is chasing a dog. <''-'road'-'grass'>
         embed.filename = ''
         register_embedding(name,embed)
 
+    def em_hash(text):
+        return hashlib.sha1(text.encode('utf-8')).hexdigest()[:8]
+
+    em_regexp = re.compile(r"<'EM[_/-](?:[0-9a-f]{8}_)?\d+'>|\{'EM[_/-](?:[0-9a-f]{8}_)?\d+'\}")
+
+    def is_temp_embedding_name(name,prod=None):
+        if not isinstance(name,str) or em_regexp.fullmatch(name) is None:
+            return False
+        if prod is None:
+            return True
+        return name.startswith("<'EM"+prod) or name.startswith("{'EM"+prod)
+
     def reset_temp_embeddings(prod,unregister):
         cache = grab_embedding_cache()
-        num = cache[prod]
         cache[prod] = 0
-        for a,b in (('<','>'),('{','}')):
-            i = num
-            while i>0:
-                tgt = a+"'EM"+prod+str(i)+"'"+b
-                if tgt in cache:
-                    embed = cache[tgt]
-                    if type(embed.vec)==dict:
-                        for k,v in embed.vec.items():
-                            embed.vec[k] = torch.zeros((0,v.shape[-1]),device=v.device)
-                    else:
-                        embed.vec = torch.zeros((0,embed.vec.shape[-1]),device=embed.vec.device)
-                    embed.vectors = 0
-                    embed.cached_checksum = None
-                    del cache[tgt]
-                    if unregister:
-                        register_embedding(tgt,None)
-                i = i-1
+        for tgt in [k for k in cache if is_temp_embedding_name(k,prod)]:
+            embed = cache[tgt]
+            if type(embed.vec)==dict:
+                for k,v in embed.vec.items():
+                    embed.vec[k] = torch.zeros((0,v.shape[-1]),device=v.device)
+            else:
+                embed.vec = torch.zeros((0,embed.vec.shape[-1]),device=embed.vec.device)
+            embed.vectors = 0
+            embed.cached_checksum = None
+            del cache[tgt]
+            if unregister:
+                register_embedding(tgt,None)
         return cache
 
-    def add_temp_embedding(vectors,cache,prod,curly,fake):
+    def add_temp_embedding(vectors,cache,prod,curly,fake,source_text=None):
         if fake>0:
             prod = '/'
             num = (cache[prod] or 0)
@@ -981,7 +1026,7 @@ A cat is chasing a dog. <''-'road'-'grass'>
             prod = '_' if prod else '-'
             num = 1+(cache[prod] or 0)
             cache[prod] = num
-        name = "'EM"+prod+str(num)+"'"
+        name = "'EM"+prod+(em_hash(source_text)+'_' if source_text is not None else '')+str(num)+"'"
         if curly:
             name = '{'+name+'}'
         else:
@@ -992,7 +1037,7 @@ A cat is chasing a dog. <''-'road'-'grass'>
     def parse_infotext(text):
         orig = text
         text += '\n'
-        pos = re.search(r"\bEmbeddingMerge:\s*(\"?[<{])'EM_",text)
+        pos = re.search(r"\bEmbeddingMerge:\s*(\"?[<{])'EM[_/-]",text)
         if pos is None:
             return (None,orig)
         head = text[:pos.span(0)[0]].rstrip()
@@ -1038,18 +1083,11 @@ A cat is chasing a dog. <''-'road'-'grass'>
         res = None
         seq = seq.lstrip()
         while True:
-            left = seq[0:5]
-            if left=="<'EM_":
-                right = "'>="
-            elif left=="{'EM_":
-                right = "'}="
-            else:
+            match = re.match(r"^(<'EM[_/-](?:[0-9a-f]{8}_)?\d+'>|\{'EM[_/-](?:[0-9a-f]{8}_)?\d+'\})=",seq)
+            if match is None:
                 return res
-            stop = seq.find(right)
-            if stop<1:
-                return res
-            what = seq[0:stop+2]
-            seq = seq[stop+3:]
+            what = match.group(1)
+            seq = seq[match.end():]
             left = seq[0:2]
             if left=="<'":
                 right = '>, '
@@ -1094,6 +1132,7 @@ A cat is chasing a dog. <''-'road'-'grass'>
             except:
                 pass
             gr_orig = gr_text
+            source_type = 'parsed_prompt_text'
             font = 'font-family:Consolas,Courier New,Courier,monospace;'
             table = '<style>.webui_embedding_merge_table,.webui_embedding_merge_table td,.webui_embedding_merge_table th{border:1px solid gray;border-collapse:collapse}.webui_embedding_merge_table td,.webui_embedding_merge_table th{padding:2px 5px !important;text-align:center !important;vertical-align:middle;'+font+'font-weight:bold;}.webui_embedding_merge_table{margin:6px auto !important;}</style>'
             (reparse,request) = parse_infotext(gr_text)
@@ -1105,6 +1144,7 @@ A cat is chasing a dog. <''-'road'-'grass'>
                     request = dict_replace(reparse,request)
                     return ('<center><b>Prompt restored.</n></center>',gr_name,request)
             if gr_text[:1]=="'":
+                source_type = 'direct_merge_expression'
                 (two,err) = merge_parser(gr_text,False)
                 if (two is not None) and two[0].numel()==0:
                     err = 'Result is ZERO vectors!'
@@ -1127,8 +1167,9 @@ A cat is chasing a dog. <''-'road'-'grass'>
                         txt += '<tr><td>ALL:</td>{}</tr>'.format(tensor_info(res))
                         txt += '</table>'
                         both = True
-                return ('<center>'+txt+'</center>',need_save_embed(store,gr_name,two,gr_tensors),gr_orig)
+                return ('<center>'+txt+'</center>',need_save_embed(store,gr_name,two,gr_tensors,gr_orig,source_type),gr_orig)
             if gr_text.find("<'")>=0 or gr_text.find("{'")>=0:
+                source_type = 'parsed_prompt_text_with_embedding_merge'
                 cache = reset_temp_embeddings('-',False)
                 used = {}
                 (mer,err) = merge_one_prompt(cache,None,{},used,gr_text,False,False)
@@ -1287,20 +1328,226 @@ A cat is chasing a dog. <''-'road'-'grass'>
                 txt += '</table>'
                 both.append(txt)
             txt = table+'<strong>↑ CLIP (L) / OpenClip (G) ↓</strong>'.join(both)
-            return ('<center>'+txt+'</center>',need_save_embed(store,gr_name,two,gr_tensors),gr_orig)
+            return ('<center>'+txt+'</center>',need_save_embed(store,gr_name,two,gr_tensors,gr_orig,source_type),gr_orig)
 
     def tensor_info(tensor):
         return '<td>{:>-14.8f}</td><td>{:>+14.8f}</td><td>{:>+14.8f}</td><td>{:>14.8f}</td><td>{:>14.8f}</td><td>{:>14.8f}</td>'.format(tensor.min().item(),tensor.max().item(),tensor.sum().item(),tensor.abs().sum().item(),torch.linalg.norm(tensor,ord=2),tensor.std()).replace(' ','&nbsp;')
 
     merge_dir = None
 
-    def need_save_embed(store,name,pair,tensors):
+    def git_read(path,*args):
+        try:
+            return subprocess.check_output(['git']+list(args),cwd=path,stderr=subprocess.DEVNULL,text=True).strip()
+        except:
+            return None
+
+    def git_repo_info(path):
+        branch = git_read(path,'rev-parse','--abbrev-ref','HEAD')
+        commit = git_read(path,'rev-parse','HEAD')
+        dirty = git_read(path,'status','--short')
+        return {
+          'path': path,
+          'branch': branch,
+          'commit': commit,
+          'dirty': None if dirty is None else dirty!='',
+        }
+
+    def checkpoint_provenance():
+        model = getattr(shared,'sd_model',None)
+        info = getattr(model,'sd_checkpoint_info',None) if model is not None else None
+        return {
+          'title': getattr(info,'title',None),
+          'model_name': getattr(info,'model_name',None),
+          'filename': getattr(info,'filename',None),
+          'hash': getattr(info,'hash',None),
+          'shorthash': getattr(info,'shorthash',None),
+          'sd_model_hash': getattr(model,'sd_model_hash',None) if model is not None else None,
+        }
+
+    def tensor_provenance(tensors):
+        stats = {}
+        def walk(prefix,value):
+            if isinstance(value,torch.Tensor):
+                yield (prefix,value)
+            elif isinstance(value,dict):
+                for k,v in value.items():
+                    key = str(k) if prefix=='' else prefix+'.'+str(k)
+                    for item in walk(key,v):
+                        yield item
+        for key,tensor in walk('',tensors):
+            if not isinstance(tensor,torch.Tensor):
+                continue
+            base = tensor.detach().cpu()
+            flat = base.float().reshape(-1)
+            numel = int(flat.numel())
+            if numel==0:
+                zero = True
+                stat = {
+                  'shape': list(base.shape),
+                  'dtype': str(base.dtype),
+                  'numel': numel,
+                  'min': None,
+                  'max': None,
+                  'sum': 0.0,
+                  'abs_sum': 0.0,
+                  'l2_norm': 0.0,
+                  'std': 0.0,
+                  'zero_vector': zero,
+                }
+            else:
+                abs_max = flat.abs().max().item()
+                zero = abs_max==0
+                stat = {
+                  'shape': list(base.shape),
+                  'dtype': str(base.dtype),
+                  'numel': numel,
+                  'min': float(flat.min().item()),
+                  'max': float(flat.max().item()),
+                  'sum': float(flat.sum().item()),
+                  'abs_sum': float(flat.abs().sum().item()),
+                  'l2_norm': float(torch.linalg.norm(flat,ord=2).item()),
+                  'std': float(flat.std(unbiased=False).item()),
+                  'zero_vector': bool(zero),
+                }
+            stats[str(key)] = stat
+        return stats
+
+    def tensor_architecture(tensor_stats,variant):
+        keys = set(tensor_stats.keys())
+        if 'clip_l' in keys and 'clip_g' in keys:
+            return 'sdxl_dual_encoder'
+        if variant.startswith('converted_'):
+            return 'converted_output'
+        if variant=='legacy_pt':
+            return 'sd1_style'
+        if 'emb_params' in keys:
+            return 'sd1_style'
+        return 'unknown'
+
+    def record_saved_output(pt,path,outputs,variant,requested_path=None,save_fallback_reason=None,target_was_locked=False):
+        tensor_stats = tensor_provenance(pt)
+        tensor_dtypes = {k:v['dtype'] for k,v in tensor_stats.items()}
+        outputs.append({
+          'path': path,
+          'requested_output_path': requested_path or path,
+          'actual_output_path': path,
+          'save_fallback_reason': save_fallback_reason,
+          'target_was_locked': bool(target_was_locked),
+          'variant': variant,
+          'tensor_keys': list(tensor_stats.keys()),
+          'tensor_shapes': {k:v['shape'] for k,v in tensor_stats.items()},
+          'tensor_dtypes': tensor_dtypes,
+          'tensor_dtype': list(set(tensor_dtypes.values()))[0] if len(set(tensor_dtypes.values()))==1 else 'mixed',
+          'tensor_stats': tensor_stats,
+          'architecture': tensor_architecture(tensor_stats,variant),
+        })
+
+    def is_locked_safetensors_error(e):
+        message = str(e).lower()
+        return ('1224' in message) or ('user-mapped section' in message) or ('mapped section' in message)
+
+    def new_safetensors_path(path):
+        base,ext = os.path.splitext(path)
+        stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        fallback = base+'.new-'+stamp+ext
+        i = 1
+        while os.path.exists(fallback):
+            fallback = base+'.new-'+stamp+'-'+str(i)+ext
+            i += 1
+        return fallback
+
+    def save_provenance_context(name,source_text,source_type,tensors):
+        extension_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        forge_root = os.path.dirname(os.path.dirname(extension_root))
+        return {
+          'schema_version': 'embedding_merge_provenance_v1',
+          'embedding_name': name,
+          'created_at_utc': datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00','Z'),
+          'extension': 'stable-diffusion-webui-embedding-merge',
+          'extension_git': git_repo_info(extension_root),
+          'forge_neo_git': git_repo_info(forge_root),
+          'python_version': sys.version,
+          'torch_version': getattr(torch,'__version__',None),
+          'source_text': source_text or '',
+          'source_type': source_type or 'unknown',
+          'active_checkpoint': checkpoint_provenance(),
+          'save_options': {
+            'gr_tensors': bool(tensors),
+            'conversion_outputs_enabled': bool(tensors),
+          },
+        }
+
+    def save_safetensors_with_provenance(pt,path,context,outputs,variant):
+        from safetensors.torch import save_file
+        tensor_stats = tensor_provenance(pt)
+        summary = {
+          'variant': variant,
+          'tensor_keys': list(tensor_stats.keys()),
+          'tensor_shapes': {k:v['shape'] for k,v in tensor_stats.items()},
+          'tensor_dtypes': {k:v['dtype'] for k,v in tensor_stats.items()},
+          'architecture': tensor_architecture(tensor_stats,variant),
+        }
+        metadata = {
+          'embedding_merge_schema': context['schema_version'],
+          'embedding_merge_name': context['embedding_name'],
+          'embedding_merge_created_at_utc': context['created_at_utc'],
+          'embedding_merge_source_text': context['source_text'],
+          'embedding_merge_extension_commit': context['extension_git'].get('commit') or '',
+          'embedding_merge_tensor_summary_json': json.dumps(summary,sort_keys=True,separators=(',',':')),
+        }
+        try:
+            save_file(pt,path,metadata=metadata)
+            record_saved_output(pt,path,outputs,variant)
+        except Exception as e:
+            if not is_locked_safetensors_error(e):
+                print('Embedding Merge: failed to save '+path+': '+str(e))
+                raise
+            fallback = new_safetensors_path(path)
+            try:
+                save_file(pt,fallback,metadata=metadata)
+            except Exception as fallback_e:
+                print('Embedding Merge: failed to save fallback '+fallback+': '+str(fallback_e))
+                raise
+            print('Embedding Merge: target locked, saved new file instead: '+fallback)
+            record_saved_output(pt,fallback,outputs,variant,path,str(e),True)
+
+    def write_provenance_sidecars(context,outputs):
+        output_files = [item['path'] for item in outputs]
+        for item in outputs:
+            sidecar = os.path.splitext(item['path'])[0]+'.provenance.json'
+            try:
+                provenance = dict(context)
+                provenance.update({
+                  'this_output_file': item['path'],
+                  'output_files_written': output_files,
+                  'requested_output_path': item['requested_output_path'],
+                  'actual_output_path': item['actual_output_path'],
+                  'save_fallback_reason': item['save_fallback_reason'],
+                  'target_was_locked': item['target_was_locked'],
+                  'output_variant': item['variant'],
+                  'tensor_keys': item['tensor_keys'],
+                  'tensor_shapes': item['tensor_shapes'],
+                  'tensor_dtypes': item['tensor_dtypes'],
+                  'tensor_dtype': item['tensor_dtype'],
+                  'tensor_stats': item['tensor_stats'],
+                  'architecture': item['architecture'],
+                })
+                with open(sidecar,'w',encoding='utf-8') as f:
+                    json.dump(provenance,f,indent=2,sort_keys=True)
+                    f.write('\n')
+                print('Embedding Merge: saved provenance to '+sidecar)
+            except Exception as e:
+                print('Embedding Merge: warning: failed to save provenance to '+sidecar+': '+str(e))
+
+    def need_save_embed(store,name,pair,tensors,source_text=None,source_type=None):
         if not store:
             return name
         name = ''.join( x for x in name if (x.isalnum() or x in '._- ')).strip()
         if name=='':
             return name
         try:
+            provenance = save_provenance_context(name,source_text,source_type,tensors)
+            saved_outputs = []
             if type(pair[0])==list:
                 vectors = [torch.cat([r[0] for r in pair[0]])]
                 if (len(pair)>1) and (pair[1] is not None):
@@ -1336,13 +1583,14 @@ A cat is chasing a dog. <''-'road'-'grass'>
                     res = torch.load(target+'.pt',map_location='cpu')
                 except:
                     res = None
+                if res is not None:
+                    record_saved_output(pt,target+'.pt',saved_outputs,'legacy_pt')
             if res is None:
                 if len(vectors)==1:
                     pt = {
                       'emb_params': vectors[0].cpu(),
                     }
-                from safetensors.torch import save_file
-                save_file(pt,target+'.safetensors')
+                save_safetensors_with_provenance(pt,target+'.safetensors',provenance,saved_outputs,'main')
                 try:
                     os.unlink(target+'.pt')
                 except:
@@ -1364,10 +1612,9 @@ A cat is chasing a dog. <''-'road'-'grass'>
                             pass
                         target = os.path.join(folder,name)+'.safetensors'
                         if vector is not None:
-                            from safetensors.torch import save_file
-                            save_file({
+                            save_safetensors_with_provenance({
                               'emb_params': vector.cpu(),
-                            },target)
+                            },target,provenance,saved_outputs,'converted_sd1')
                 else:
                     folder = os.path.join(merge_dir,'sdxl')
                     vector = vectors[0]
@@ -1390,8 +1637,8 @@ A cat is chasing a dog. <''-'road'-'grass'>
                         pass
                     target = os.path.join(folder,name)+'.safetensors'
                     if pt is not None:
-                        from safetensors.torch import save_file
-                        save_file(pt,target)
+                        save_safetensors_with_provenance(pt,target,provenance,saved_outputs,'converted_sdxl')
+            write_provenance_sidecars(provenance,saved_outputs)
             for db in get_embedding_db():
                 try:
                     db.load_textual_inversion_embeddings(force_reload=True)
@@ -1417,8 +1664,6 @@ A cat is chasing a dog. <''-'road'-'grass'>
             def __getattribute__(self,_):
                 raise Exception_From_EmbeddingMergeExtension(msg)
         p.__class__ = Exception_From_EmbeddingMergeExtension_
-
-    em_regexp = re.compile(r"<'EM[_/-]\d+'>|{'EM[_/-]\d+'}")
 
     def merge_one_prompt(cache,texts,parts,used,prompt,prod,only_count):
         #if len(get_model_clips())>1:
@@ -1474,7 +1719,7 @@ A cat is chasing a dog. <''-'road'-'grass'>
                         if (res is None) or (res[0].numel()==0):
                             embed = ''
                         else:
-                            embed = add_temp_embedding(res,cache,prod,curly,0)
+                            embed = add_temp_embedding(res,cache,prod,curly,0,part)
                     if used is not None:
                         used[embed] = part
                     parts[part] = embed
@@ -1639,7 +1884,7 @@ A cat is chasing a dog. <''-'road'-'grass'>
     try:
         sd_hijack = getattr(modules,'sd_hijack',None)
         if sd_hijack is None:
-            print('Embedding Merge: prompt-length hook skipped because modules.sd_hijack is unavailable')
+            print('Embedding Merge: A1111 prompt-length hook unavailable; continuing with Forge Neo compatibility mode')
         else:
             cls = sd_hijack.StableDiffusionModelHijack
             get_prompt_lengths = cls.get_prompt_lengths
