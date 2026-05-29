@@ -99,6 +99,8 @@ If you type a new name into the textbox on the bottom, your whole current prompt
 - Creating a shortened part to quickly use in prompts (not recommended though, since you will lose the original text later), but with no other benefits;
 - Prepare TI embedding for actual training by using existing embeddings for its initialization.
 
+Saved `.safetensors` embeddings also include Embedding Merge provenance metadata and a sidecar `.provenance.json` file beside the saved embedding. This records the source merge expression or parsed prompt text, tensor keys and shapes, basic tensor statistics, save options, checkpoint information when available, and the actual output path. On Windows, if Forge/WebUI already has the requested `.safetensors` file memory-mapped and it cannot be overwritten, Embedding Merge saves a timestamped sibling such as `name.new-YYYYMMDD-HHMMSS.safetensors` and writes provenance for that actual output file.
+
 ## Test merge expression:
 
 In EM tab you can enter a "merge expression" that starts with a single quote, to see how it will be parsed and combined by this extension. It should contain single quotes around literal texts or TI embeddings, and special operators between them. For example:
@@ -189,7 +191,7 @@ Eliminating a part of the negative prompt by zeroing its vectors can be used to 
 
 ## Using merge expressions in prompts at runtime!
 
-You can actually put merge expressions in angular or curly brackets into your txt2img or img2img prompt in WebUI. This extension will intercept both main and negative prompts, parse and merge expressions creating temporary TI embeddings that WebUI will "see" instead of your original text. In generation info there will be internal meaningless names like <'EM_1'>, but extra parameter "EmbeddingMerge" will contain original merge expressions. To quickly restore your prompts, just paste your complete generation information (from .txt or PNG Info) into the textbox on EM tab (also it should work for the official "paste" toolbar button too) – its temporary embeddings will be replaced back with expressions, for example:
+You can actually put merge expressions in angular or curly brackets into your txt2img or img2img prompt in WebUI. This extension will intercept both main and negative prompts, parse and merge expressions creating temporary TI embeddings that WebUI will "see" instead of your original text. In generation info there will be internal meaningless names like <'EM_1'> or Forge-compatible cache-busting names like <'EM_1a2b3c4d_1'>, but extra parameter "EmbeddingMerge" will contain original merge expressions. To quickly restore your prompts, just paste your complete generation information (from .txt or PNG Info) into the textbox on EM tab (also it should work for the official "paste" toolbar button too) – its temporary embeddings will be replaced back with expressions, for example:
 
 > a photo of <'EM_1'>  
 Negative prompt: {'EM_2'}  
